@@ -75,50 +75,94 @@ class TSDPDiffusionEngine:
         r_tau = torch.clamp(r_tau, min=0.1, max=10.0)
 
         P = current_states.shape[1]
-        x_t = torch.randn(batch, P, 1 + self.future_len, self.state_dim, device=device)
-        x_t[:, :, 0, :] = current_states
+        time_grid = self.time_schedule.to(device)
 
-        alpha_bar = torch.ones(batch, self.future_len, device=device)
-
-        schedule_log_probs: List[torch.Tensor] = []
-        score_log_probs: List[torch.Tensor] = []
-        schedule_dists: List[torch.distributions.Distribution] = []
-        score_dists: List[torch.distributions.Distribution] = []
         schedule_samples: List[torch.Tensor] = []
+        schedule_log_probs: List[torch.Tensor] = []
+        schedule_dists: List[torch.distributions.Distribution] = []
+        alpha_list: List[torch.Tensor] = []
+        alpha_bar_list: List[torch.Tensor] = []
 
-        for step in reversed(range(self.diffusion_steps)):
-            time_value = self.time_schedule[step].to(device).expand(batch)
-            base_beta = self.beta_min + (self.beta_max - self.beta_min) * time_value
-            scale_sample, log_prob_scale, dist_scale = self.schedule_policy(global_context, time_value, stochastic=not deterministic)
+        alpha_cum = torch.ones(batch, self.future_len, device=device)
+        for step in range(self.diffusion_steps):
+            time_value = time_grid[step].expand(batch)
+            scale_sample, log_prob_scale, dist_scale = self.schedule_policy(
+                global_context, time_value, stochastic=not deterministic
+            )
             schedule_samples.append(scale_sample)
             schedule_log_probs.append(log_prob_scale)
             schedule_dists.append(dist_scale)
 
-            beta_eff = base_beta.unsqueeze(-1) * scale_sample.unsqueeze(-1) * r_tau
+            beta_base = self.beta_min + (self.beta_max - self.beta_min) * time_value
+            beta_eff = beta_base.unsqueeze(-1) * scale_sample.unsqueeze(-1) * r_tau
             beta_eff = beta_eff.clamp(min=1e-4, max=0.999)
             alpha = (1.0 - beta_eff).clamp(min=1e-4, max=0.999)
-            alpha_bar = alpha_bar * alpha
 
-            t_tensor = time_value
-            score = self._backbone_score(inputs, x_t, t_tensor, neighbor_mask)
-            delta_flat, log_prob_delta, dist_delta = self.score_policy(global_context, x_t[:, :, 1:, :], stochastic=not deterministic)
-            score_log_probs.append(log_prob_delta)
+            alpha_cum = alpha_cum * alpha
+
+            alpha_list.append(alpha)
+            alpha_bar_list.append(alpha_cum.clone())
+
+        x_future = torch.randn(batch, P, self.future_len, self.state_dim, device=device)
+        score_log_prob_steps: List[torch.Tensor] = []
+        score_dists: List[torch.distributions.Distribution] = []
+
+        model_type = getattr(self.backbone.decoder.decoder.dit, "model_type", "x_start")
+        if model_type != "x_start":
+            raise ValueError(f"TSDP sampling currently supports only 'x_start' backbone models, got '{model_type}'.")
+
+        eps_denom_eps = 1e-6
+
+        for step in reversed(range(self.diffusion_steps)):
+            time_value = time_grid[step].expand(batch)
+            x_full = torch.cat([current_states[:, :, None, :], x_future], dim=2)
+            score = self._backbone_score(inputs, x_full, time_value, neighbor_mask)
+
+            delta_flat, log_prob_delta, dist_delta = self.score_policy(
+                global_context, x_future, stochastic=not deterministic
+            )
+            score_log_prob_steps.append(log_prob_delta)
             score_dists.append(dist_delta)
 
             delta = delta_flat.reshape(batch, P, self.future_len, self.state_dim)
             guided_x0 = score + delta
 
-            std = torch.sqrt((1.0 - alpha_bar).clamp(min=1e-6))
-            noise = torch.zeros_like(guided_x0) if deterministic else torch.randn_like(guided_x0)
-            x_future = torch.sqrt(alpha_bar[:, None, :, None]) * guided_x0 + std[:, None, :, None] * noise
-            x_t = torch.cat([current_states[:, :, None, :], x_future], dim=2)
+            alpha = alpha_list[step]
+            alpha_bar_t = alpha_bar_list[step]
+            if step > 0:
+                alpha_bar_prev = alpha_bar_list[step - 1]
+            else:
+                alpha_bar_prev = torch.ones_like(alpha_bar_t)
+
+            alpha_expand = alpha.unsqueeze(1).unsqueeze(-1)
+            alpha_bar_t_expand = alpha_bar_t.unsqueeze(1).unsqueeze(-1)
+            alpha_bar_prev_expand = alpha_bar_prev.unsqueeze(1).unsqueeze(-1)
+
+            sqrt_alpha_bar_t = torch.sqrt(alpha_bar_t_expand + eps_denom_eps)
+            sqrt_one_minus_alpha_bar_t = torch.sqrt(1 - alpha_bar_t_expand + eps_denom_eps)
+            eps = (x_future - sqrt_alpha_bar_t * guided_x0) / sqrt_one_minus_alpha_bar_t
+
+            coef = (1 - alpha_expand) / sqrt_one_minus_alpha_bar_t
+            mean = (x_future - coef * eps) / torch.sqrt(alpha_expand + eps_denom_eps)
+
+            if deterministic:
+                x_future = mean
+            else:
+                beta_tilde = ((1 - alpha_bar_prev_expand) / (1 - alpha_bar_t_expand + eps_denom_eps)) * (1 - alpha_expand)
+                noise = torch.randn_like(x_future)
+                x_future = mean + torch.sqrt(beta_tilde.clamp(min=eps_denom_eps)) * noise
+
+        schedule_samples_tensor = torch.stack(schedule_samples, dim=0)
+        schedule_log_probs_tensor = torch.stack(schedule_log_probs, dim=0)
+        score_log_probs_tensor = torch.stack(list(reversed(score_log_prob_steps)), dim=0)
+        score_dists = list(reversed(score_dists))
 
         return {
-            "trajectories": x_t[:, :, 1:, :],
-            "schedule_log_probs": torch.stack(schedule_log_probs, dim=0),
-            "score_log_probs": torch.stack(score_log_probs, dim=0),
+            "trajectories": x_future,
+            "schedule_log_probs": schedule_log_probs_tensor,
+            "score_log_probs": score_log_probs_tensor,
             "schedule_dists": schedule_dists,
             "score_dists": score_dists,
-            "schedule_samples": torch.stack(schedule_samples, dim=0),
+            "schedule_samples": schedule_samples_tensor,
             "anisotropy": r_tau,
         }

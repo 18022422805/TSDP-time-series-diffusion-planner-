@@ -118,8 +118,9 @@ def main() -> None:
         inputs[k] = tensor
     inputs = obs_normalizer(inputs)
 
-    stats = compute_time_series_stats(inputs, args.future_len)
-    global_context = compute_global_context(stats, inputs)
+    denorm_inputs = obs_normalizer.inverse(inputs)
+    stats = compute_time_series_stats(denorm_inputs, args.future_len)
+    global_context = compute_global_context(stats, denorm_inputs)
 
     rollout = engine.generate(inputs, stats, global_context, deterministic=infer_cfg.get("deterministic", True))
     trajectories = rollout["trajectories"]
@@ -128,18 +129,19 @@ def main() -> None:
     schedule_samples = rollout["schedule_samples"]
     anisotropy_factor = rollout["anisotropy"]
     time_grid = engine.time_schedule.to(device)
-    dynamic_schedule = []
     beta_min = engine.beta_min
     beta_max = engine.beta_max
+    dynamic_schedule = []
     for idx in range(time_grid.shape[0]):
         base_beta = beta_min + (beta_max - beta_min) * time_grid[idx]
-        dynamic_schedule.append(base_beta * schedule_samples[idx, 0] * anisotropy_factor[0])
+        step_scale = schedule_samples[idx].unsqueeze(-1)  # [B, 1]
+        dynamic_schedule.append(base_beta * step_scale * anisotropy_factor)
     dynamic_schedule = torch.stack(dynamic_schedule, dim=0)
 
     output = {
         "trajectory": denorm_traj.squeeze(0).cpu(),
         "anisotropy": anisotropy_factor.squeeze(0).cpu(),
-        "schedule": dynamic_schedule.cpu(),
+        "schedule": dynamic_schedule[:, 0].cpu(),
     }
     torch.save(output, args.output)
     print(f"Inference complete. Saved to {args.output}")

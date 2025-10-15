@@ -10,11 +10,18 @@ def _safe_mean(tensor: torch.Tensor, dim: int, keepdim: bool = False) -> torch.T
 
 
 def compute_time_series_stats(inputs: Dict[str, torch.Tensor], future_len: int) -> torch.Tensor:
+    """
+    Compute time-series statistics in the physical domain.
+    `inputs` is expected to contain *denormalized* tensors.
+    """
     device = inputs["ego_current_state"].device
+    dtype = inputs["ego_current_state"].dtype
+    zero = torch.zeros(1, device=device, dtype=dtype)
+
     batch = inputs["ego_current_state"].shape[0]
 
     neighbors = inputs["neighbor_agents_past"][..., :2]
-    neighbor_mask = torch.isclose(neighbors.abs().sum(dim=-1), torch.tensor(0.0, device=device))
+    neighbor_mask = torch.isclose(neighbors.abs().sum(dim=-1), zero)
     velocity = neighbors[..., 1:, :] - neighbors[..., :-1, :]
     velocity_mask = neighbor_mask[..., 1:] | neighbor_mask[..., :-1]
     speed = velocity.norm(dim=-1)
@@ -25,10 +32,11 @@ def compute_time_series_stats(inputs: Dict[str, torch.Tensor], future_len: int) 
     acc_mask = velocity_mask[..., 1:] | velocity_mask[..., :-1]
     acc_mag = acceleration.norm(dim=-1)
     acc_mag = torch.where(acc_mask, torch.zeros_like(acc_mag), acc_mag)
-    acc_var = _safe_mean((acc_mag - _safe_mean(acc_mag, dim=2, keepdim=True)) ** 2, dim=(1, 2))
+    acc_centered = acc_mag - _safe_mean(acc_mag, dim=2, keepdim=True)
+    acc_var = _safe_mean(acc_centered ** 2, dim=(1, 2))
 
     route = inputs["route_lanes"][..., :2]
-    route_mask = torch.isclose(route.abs().sum(dim=-1), torch.tensor(0.0, device=device))
+    route_mask = torch.isclose(route.abs().sum(dim=-1), zero)
     first_diff = route[..., 1:, :] - route[..., :-1, :]
     second_diff = first_diff[..., 1:, :] - first_diff[..., :-1, :]
     curvature = torch.linalg.norm(second_diff, dim=-1)
@@ -36,7 +44,7 @@ def compute_time_series_stats(inputs: Dict[str, torch.Tensor], future_len: int) 
     curvature = torch.where(curvature_mask, torch.zeros_like(curvature), curvature)
     curvature = _safe_mean(curvature, dim=(1, 2))
 
-    tau = torch.linspace(0.0, 1.0, future_len, device=device).unsqueeze(0).expand(batch, -1)
+    tau = torch.linspace(0.0, 1.0, future_len, device=device, dtype=dtype).unsqueeze(0).expand(batch, -1)
     stats = torch.stack(
         [
             tau,
@@ -50,10 +58,18 @@ def compute_time_series_stats(inputs: Dict[str, torch.Tensor], future_len: int) 
 
 
 def compute_global_context(stats: torch.Tensor, inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
+    """
+    Build global context features from *denormalized* tensors.
+    """
     batch = stats.shape[0]
     device = stats.device
+    dtype = stats.dtype
     ego = inputs["ego_current_state"]
-    ego_speed = torch.linalg.norm(ego[:, 4:6], dim=-1, keepdim=True) if ego.shape[-1] >= 6 else ego[:, :1]
+    if ego.shape[-1] >= 6:
+        ego_speed = torch.linalg.norm(ego[:, 4:6], dim=-1, keepdim=True)
+    else:
+        ego_speed = torch.linalg.norm(ego[:, :2], dim=-1, keepdim=True)
+
     ego_heading = torch.stack(
         [torch.cos(ego[:, 2:3]), torch.sin(ego[:, 2:3])], dim=-1
     ).reshape(batch, -1)
@@ -61,7 +77,8 @@ def compute_global_context(stats: torch.Tensor, inputs: Dict[str, torch.Tensor])
     stats_std = stats.std(dim=1).clamp(min=1e-6)
 
     neighbor_positions = inputs["neighbor_agents_past"][..., :2]
-    neighbor_mask = torch.isclose(neighbor_positions.abs().sum(dim=-1), torch.tensor(0.0, device=device))
+    zero = torch.zeros(1, device=device, dtype=dtype)
+    neighbor_mask = torch.isclose(neighbor_positions.abs().sum(dim=-1), zero)
     neighbor_last = neighbor_positions[..., -1, :]
     neighbor_last = torch.where(neighbor_mask[..., -1, None], torch.zeros_like(neighbor_last), neighbor_last)
     neighbor_disp = torch.linalg.norm(neighbor_last - ego[:, None, :2], dim=-1)

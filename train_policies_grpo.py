@@ -207,13 +207,14 @@ def main() -> None:
         total_reward_epoch = []
         for batch in loader:
             inputs, _, _, _ = prepare_inputs(batch, args, device, obs_normalizer, aug)
-            stats = compute_time_series_stats(inputs, args.future_len)
-            global_context = compute_global_context(stats, inputs)
+            denorm_inputs = obs_normalizer.inverse(inputs)
+            stats = compute_time_series_stats(denorm_inputs, args.future_len)
+            global_context = compute_global_context(stats, denorm_inputs)
 
             rollout = engine.generate(inputs, stats, global_context, deterministic=False)
             trajectories = rollout["trajectories"]
             world_trajectories = state_normalizer.inverse(trajectories)
-            reward_inputs = obs_normalizer.inverse(inputs)
+            reward_inputs = denorm_inputs
 
             patch_rewards, total_reward = compute_patch_rewards(
                 world_trajectories,

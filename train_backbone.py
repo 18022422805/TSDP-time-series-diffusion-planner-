@@ -161,7 +161,8 @@ def main() -> None:
         epoch_loss = []
         for batch in loader:
             inputs, ego_future, neighbors_future, neighbor_mask = prepare_inputs(batch, args, device, obs_normalizer, aug)
-            stats = compute_time_series_stats(inputs, args.future_len)
+            denorm_inputs = obs_normalizer.inverse(inputs)
+            stats = compute_time_series_stats(denorm_inputs, args.future_len)
 
             loss_dict, _, _ = phase1_loss(
                 backbone,
