@@ -1,0 +1,10 @@
+planner:
+  _target_: diffusion_planner.nuplan_planner.tsdp_planner.TSDPPlanner
+  _convert_: all
+
+  cfg:
+    phase1_ckpt: ${oc.env:PHASE1_CKPT}
+    phase2_ckpt: ${oc.env:PHASE2_CKPT}
+    normalization_file_path: ${oc.env:NORMALIZATION_JSON,normalization.json}
+    config_file: ${oc.env:TSDP_CONFIG,tsdp_config.yaml}
+    device: ${oc.env:TSDP_DEVICE,cuda}
